@@ -109,7 +109,7 @@ jobs:
     steps:
       - name: Extract linked issues from PR body
         id: extract
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           github-token: ${{ github.token }}
           script: |
@@ -151,7 +151,7 @@ jobs:
 
     steps:
       - name: Close issues and add release comment
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           github-token: ${{ github.token }}
           script: |
@@ -248,7 +248,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Update issues to Done status
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           PROJECT_URL: ${{ secrets.PROJECT_URL }}
         with:
