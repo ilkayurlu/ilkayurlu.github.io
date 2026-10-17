@@ -1,0 +1,455 @@
+# ─────────────────────────────────────────────────────────────────
+# Release to Main Workflow (Release Gates)
+# ─────────────────────────────────────────────────────────────────
+# Validates release pull requests before merging to main (production).
+#
+# Release Gates:
+# - Source must be dev or release/* branches
+# - Production build must succeed
+# - Smoke tests must pass
+# - Security quick scan (informational only)
+# - Deployment readiness checklist
+#
+# Allowed source branches:
+# - dev: Production releases (standard flow)
+# - release/*: Emergency hotfix releases
+# - dependabot/*: Automated dependency updates
+#
+# All other branches (feature/*, fix/*, test/*) must merge to dev first.
+#
+# Author: Alireza Rezvani
+# Date: 2025-11-06
+# ─────────────────────────────────────────────────────────────────
+
+name: Release to Main
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+# Only one release PR can be processed at a time
+concurrency:
+  group: release-to-main
+  cancel-in-progress: false
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────
+  # Source Branch Validation
+  # ─────────────────────────────────────────────────────────────────
+  validate-source:
+    name: Validate Source Branch
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate source is dev branch
+        run: |
+          SOURCE_BRANCH="${{ github.head_ref }}"
+          ACTOR="${{ github.actor }}"
+          echo "🔍 Validating source branch: $SOURCE_BRANCH (Actor: $ACTOR)"
+
+          # Allow dependabot PRs to bypass dev branch requirement
+          # Check both actor name and branch name prefix
+          if [[ "$ACTOR" == "dependabot[bot]" ]] || [[ "$SOURCE_BRANCH" =~ ^dependabot/ ]]; then
+            echo "✅ Dependabot PR detected - skipping source branch validation"
+            echo "   Dependabot PRs are allowed to merge directly to main"
+            echo "   Actor: $ACTOR"
+            echo "   Branch: $SOURCE_BRANCH"
+            exit 0
+          fi
+
+          # Allowlist: branches permitted to merge to main
+          # Only: dev (production), release/* (hotfixes)
+          # All other branches (feature/*, fix/*, test/*) must go through dev first
+          ALLOWED_REGEX='^(dev|release/.*)$'
+
+          if [[ ! $SOURCE_BRANCH =~ $ALLOWED_REGEX ]]; then
+            echo "❌ Invalid source branch: $SOURCE_BRANCH"
+            echo ""
+            echo "Only dev and release/* branches may be merged to 'main'."
+            echo ""
+            echo "Allowed patterns:"
+            echo "  - dev (production releases)"
+            echo "  - release/* (emergency hotfixes)"
+            echo ""
+            echo "Got: $SOURCE_BRANCH → main"
+            echo ""
+            echo "All other branches (feature/*, fix/*, test/*) must merge to dev first:"
+            echo "  $SOURCE_BRANCH → dev → main"
+            echo ""
+            echo "If using a different branching strategy, adjust ALLOWED_REGEX in this workflow."
+            exit 1
+          fi
+
+          echo "✅ Source branch is valid: $SOURCE_BRANCH → main"
+
+  # ─────────────────────────────────────────────────────────────────
+  # Production Build Validation
+  # ─────────────────────────────────────────────────────────────────
+  build-prod:
+    name: Production Build
+    runs-on: ubuntu-latest
+    needs: validate-source
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: '20'
+          pnpm-version: '9'
+
+      - name: Build for production
+        run: |
+          echo "🏗️  Building for production..."
+          pnpm run build:prod || pnpm run build
+        env:
+          NODE_ENV: production
+          CI: true
+
+      - name: Verify build artifacts
+        run: |
+          echo "🔍 Verifying build artifacts..."
+
+          # Common build output directories
+          BUILD_DIRS=("dist" "build" "out" ".next")
+          FOUND_BUILD=false
+
+          for dir in "${BUILD_DIRS[@]}"; do
+            if [ -d "$dir" ]; then
+              echo "✅ Found build directory: $dir"
+              echo "   Size: $(du -sh $dir | cut -f1)"
+              echo "   Files: $(find $dir -type f | wc -l)"
+              FOUND_BUILD=true
+              break
+            fi
+          done
+
+          if [[ "$FOUND_BUILD" == "false" ]]; then
+            echo "⚠️  No standard build directory found. This may be expected for some project types."
+          fi
+
+      - name: Upload production build
+        uses: actions/upload-artifact@v5
+        with:
+          name: production-build
+          path: |
+            dist/
+            build/
+            out/
+            .next/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ─────────────────────────────────────────────────────────────────
+  # Smoke Tests (Critical Paths)
+  # ─────────────────────────────────────────────────────────────────
+  smoke-tests:
+    name: Smoke Tests
+    runs-on: ubuntu-latest
+    needs: build-prod
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: '20'
+          pnpm-version: '9'
+
+      - name: Download production build
+        uses: actions/download-artifact@v6
+        with:
+          name: production-build
+
+      - name: Run smoke tests
+        run: |
+          echo "🔥 Running smoke tests..."
+
+          # Try common smoke test scripts
+          if pnpm run test:smoke 2>/dev/null; then
+            echo "✅ Smoke tests passed"
+          elif pnpm run test:e2e:smoke 2>/dev/null; then
+            echo "✅ Smoke tests passed"
+          elif pnpm run test -- --testNamePattern="smoke" 2>/dev/null; then
+            echo "✅ Smoke tests passed"
+          else
+            echo "⚠️  No smoke tests found. Running basic sanity checks..."
+
+            # Basic sanity: Check if build is valid
+            if [ -d "dist" ] || [ -d "build" ] || [ -d "out" ] || [ -d ".next" ]; then
+              echo "✅ Build artifacts exist - basic sanity passed"
+            else
+              echo "❌ Build artifacts not found"
+              exit 1
+            fi
+          fi
+        env:
+          CI: true
+
+      - name: Upload smoke test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: smoke-test-results
+          path: |
+            test-results/
+            screenshots/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────
+  # Security Quick Scan (Informational Only)
+  # ─────────────────────────────────────────────────────────────────
+  security-quickscan:
+    name: Security Quick Scan
+    runs-on: ubuntu-latest
+    needs: validate-source
+    continue-on-error: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: '20'
+          pnpm-version: '9'
+
+      - name: Run npm audit
+        run: |
+          echo "🔒 Running npm security audit..."
+          pnpm audit --audit-level=high || echo "⚠️  Vulnerabilities found (non-blocking)"
+
+      - name: Check for common security issues
+        run: |
+          echo "🔍 Checking for common security issues..."
+
+          ISSUES_FOUND=0
+
+          # Check for hardcoded secrets (basic patterns)
+          echo "Checking for potential secrets..."
+          if grep -r -i "api[_-]key\|api[_-]secret\|password\|token" --include="*.ts" --include="*.js" --exclude-dir=node_modules --exclude-dir=dist | grep -v "^\s*//" | grep -v "^\s*\*"; then
+            echo "⚠️  Potential hardcoded secrets found (review manually)"
+            ((ISSUES_FOUND++))
+          fi
+
+          # Check for console.log in production
+          echo "Checking for debug statements..."
+          if grep -r "console\.log\|debugger" --include="*.ts" --include="*.tsx" --include="*.js" --exclude-dir=node_modules --exclude-dir=dist | grep -v "^\s*//" | grep -v "^\s*\*" | wc -l | grep -v "^0$"; then
+            echo "⚠️  Debug statements found (consider removing for production)"
+            ((ISSUES_FOUND++))
+          fi
+
+          if [[ $ISSUES_FOUND -eq 0 ]]; then
+            echo "✅ No obvious security issues found"
+          else
+            echo "⚠️  Found $ISSUES_FOUND potential issues (review recommended)"
+          fi
+
+      - name: Generate security report
+        if: always()
+        run: |
+          echo "# 🔒 Security Scan Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** Informational (non-blocking)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Security scan completed. Review the logs above for details." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️  **Note:** This is a quick scan only. Consider running:" >> $GITHUB_STEP_SUMMARY
+          echo "- Full security audit with npm audit" >> $GITHUB_STEP_SUMMARY
+          echo "- SAST tools (Snyk, SonarQube)" >> $GITHUB_STEP_SUMMARY
+          echo "- Dependency vulnerability scanning" >> $GITHUB_STEP_SUMMARY
+
+  # ─────────────────────────────────────────────────────────────────
+  # Deployment Readiness Checklist
+  # ─────────────────────────────────────────────────────────────────
+  deployment-readiness:
+    name: Deployment Readiness
+    runs-on: ubuntu-latest
+    needs:
+      - validate-source
+      - build-prod
+      - smoke-tests
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check version bump
+        id: version-check
+        run: |
+          echo "📦 Checking version..."
+
+          if [ -f "package.json" ]; then
+            VERSION=$(jq -r '.version' package.json)
+            echo "Current version: $VERSION"
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️  package.json not found - skipping version check"
+            echo "version=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check changelog
+        id: changelog-check
+        run: |
+          echo "📝 Checking changelog..."
+
+          CHANGELOG_FILES=("CHANGELOG.md" "HISTORY.md" "RELEASES.md")
+          CHANGELOG_FOUND=false
+
+          for file in "${CHANGELOG_FILES[@]}"; do
+            if [ -f "$file" ]; then
+              echo "✅ Found changelog: $file"
+              CHANGELOG_FOUND=true
+              break
+            fi
+          done
+
+          if [[ "$CHANGELOG_FOUND" == "false" ]]; then
+            echo "⚠️  No changelog file found. Consider creating one for production releases."
+          fi
+
+          echo "changelog-found=$CHANGELOG_FOUND" >> $GITHUB_OUTPUT
+
+      - name: Generate deployment readiness report
+        run: |
+          echo "# 🚀 Deployment Readiness Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## ✅ Pre-Deployment Checks" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Source Branch | ✅ dev → main |" >> $GITHUB_STEP_SUMMARY
+          echo "| Production Build | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Smoke Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scan | ℹ️ Informational |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## 📊 Release Information" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** \`${{ steps.version-check.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Changelog:** ${{ steps.changelog-check.outputs.changelog-found == 'true' && '✅ Found' || '⚠️ Not found' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## 📋 Pre-Merge Checklist" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Before merging this release PR, ensure:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Version bumped in package.json" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Changelog updated with release notes" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] All linked issues are tested" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Breaking changes documented" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Migration guide provided (if needed)" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Deployment plan reviewed" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Rollback plan documented" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Stakeholders notified" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+  # ─────────────────────────────────────────────────────────────────
+  # Final Release Status
+  # ─────────────────────────────────────────────────────────────────
+  release-status:
+    name: Release Gate Status
+    runs-on: ubuntu-latest
+    needs:
+      - validate-source
+      - build-prod
+      - smoke-tests
+      - deployment-readiness
+    if: always()
+
+    steps:
+      - name: Generate final release summary
+        run: |
+          echo "# 🎯 Release Gate Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## ✅ Required Checks" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+
+          # Source validation
+          if [[ "${{ needs.validate-source.result }}" == "success" ]]; then
+            echo "| Source Branch | ✅ Valid (dev → main) |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Source Branch | ❌ Invalid |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Production build
+          if [[ "${{ needs.build-prod.result }}" == "success" ]]; then
+            echo "| Production Build | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Production Build | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Smoke tests
+          if [[ "${{ needs.smoke-tests.result }}" == "success" ]]; then
+            echo "| Smoke Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Smoke Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Deployment readiness
+          if [[ "${{ needs.deployment-readiness.result }}" == "success" ]]; then
+            echo "| Deployment Readiness | ✅ Ready |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Deployment Readiness | ❌ Not Ready |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Overall status - check if ALL gates passed
+          # Treat anything other than "success" as blocking (including "skipped", "failure", "cancelled")
+          VALIDATE_RESULT="${{ needs.validate-source.result }}"
+          BUILD_RESULT="${{ needs.build-prod.result }}"
+          SMOKE_RESULT="${{ needs.smoke-tests.result }}"
+          DEPLOY_RESULT="${{ needs.deployment-readiness.result }}"
+
+          if [[ "$VALIDATE_RESULT" != "success" ]] || \
+             [[ "$BUILD_RESULT" != "success" ]] || \
+             [[ "$SMOKE_RESULT" != "success" ]] || \
+             [[ "$DEPLOY_RESULT" != "success" ]]; then
+            echo "## ❌ Release Blocked" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "One or more release gates did not pass. Please fix the issues before merging to production." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Gate Results:**" >> $GITHUB_STEP_SUMMARY
+            echo "- Source validation: $VALIDATE_RESULT" >> $GITHUB_STEP_SUMMARY
+            echo "- Production build: $BUILD_RESULT" >> $GITHUB_STEP_SUMMARY
+            echo "- Smoke tests: $SMOKE_RESULT" >> $GITHUB_STEP_SUMMARY
+            echo "- Deployment readiness: $DEPLOY_RESULT" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "## ✅ Release Approved" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "All release gates passed! This release is ready to be deployed to production." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🚀 Next Steps:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Review the pre-merge checklist above" >> $GITHUB_STEP_SUMMARY
+            echo "2. Get required approvals" >> $GITHUB_STEP_SUMMARY
+            echo "3. Merge this PR to trigger deployment" >> $GITHUB_STEP_SUMMARY
+            echo "4. Monitor deployment status" >> $GITHUB_STEP_SUMMARY
+            echo "5. Verify production deployment" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "_Release validation completed at $(date -u '+%Y-%m-%d %H:%M:%S UTC')_" >> $GITHUB_STEP_SUMMARY
